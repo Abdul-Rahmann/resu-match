@@ -1,119 +1,228 @@
 import os
+import re
+import spacy
 from flask import Flask, jsonify, request
-from jupyterlab.handlers.plugin_manager_handler import plugins_handler_path
 from werkzeug.utils import secure_filename
-from  PyPDF2 import PdfReader
 import pdfplumber
 import docx
-import re
+from pdf2image import convert_from_path
+from pytesseract import image_to_string
+import logging
 
-
+# Initialize Flask app and SpaCy
 app = Flask(__name__)
+nlp = spacy.load("en_core_web_lg")  # Load SpaCy language model
 
+# Constants
 UPLOAD_FOLDER = './uploads'
 ALLOWED_EXTENSIONS = {'pdf', 'docx'}
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-def extract_email(text):
-    """Extract the first email address found in text."""
-    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    emails = re.findall(email_pattern, text)
-    return emails[0] if emails else None
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-def extract_phone(text):
-    """Extract the first phone number found in text."""
-    phone_pattern = r'\(?\+?[0-9]*\)?[-.\s]?[0-9]+[-.\s]?[0-9]+[-.\s]?[0-9]+'
-    phones = re.findall(phone_pattern, text)
-    return phones[0] if phones else None
+# Logging configuration
+logging.basicConfig(level=logging.DEBUG)
 
-def extract_skills(text):
-    """Extract skills from text."""
-    # Predefined list of skills (this can be expanded)
-    skills = ['python', 'java', 'c++', 'machine learning', 'deep learning',
-              'sql', 'html', 'css', 'javascript', 'react', 'node.js',
-              'django', 'flask', 'project management', 'aws', 'docker', 'kubernetes']
-    extracted_skills = [skill for skill in skills if skill.lower() in text.lower()]
-    return extracted_skills
 
-def extract_name(text):
+# -------------------------------------------------------
+# Preprocessing Function
+# -------------------------------------------------------
+
+def preprocess_content(content):
     """
-    Extracts the most likely candidate for the name based on position
-    and text patterns.
+    Clean up the content for better NLP processing.
+    - Removes non-ASCII characters.
+    - Handles stray vertical bars and normalizes spaces.
     """
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    try:
+        # Remove non-ASCII characters
+        content = re.sub(r'[^\x00-\x7F]+', '', content)
 
-    # Check if there are non-empty lines
-    if not lines:
-        return None
+        # Remove stray vertical bars
+        content = re.sub(r'\s*\|\s*', ' ', content)
 
-    # Consider the first few lines only (e.g., 3 lines max) to locate the name
-    for line in lines[:3]:
-        # Check if the line looks like a name (e.g., no numbers, certain character patterns)
-        if re.match(r"^[A-Z][a-z]+\s[A-Z][a-z]+$", line):
+        # Normalize multiple spaces
+        content = re.sub(r'\s+', ' ', content).strip()
+
+        return content
+    except Exception as e:
+        logging.error(f"Error while preprocessing content: {e}")
+        return ""
+
+
+# -------------------------------------------------------
+# Entity Extraction Functions (Using Preprocessed Output)
+# -------------------------------------------------------
+
+def extract_name(content):
+    """
+    Extract name using a combination of SpaCy NLP and fallback patterns.
+    Returns the first valid 'PERSON' entity or a regex-matched name.
+    """
+    doc = nlp(content)
+
+    # Attempt to extract a PERSON entity label from SpaCy
+    for ent in doc.ents:
+        if ent.label_ == "PERSON" and 1 <= len(ent.text.split()) <= 3:
+            return ent.text.strip()
+
+    # Fallback: Look at the first 5 lines for a likely name
+    lines = content.splitlines()
+    for line in lines[:5]:
+        line = line.strip()
+        if re.match(r"^[A-Z][a-z]+(?:\s[A-Z][a-z]+)*$", line):
             return line
 
-    # Fallback: If no valid name pattern is found, return the first non-empty line
-    return lines[0] if lines else None
+    return "Name not found"
 
-def extract_experience(text):
-    """Extract work experience from text by searching for dates or keywords."""
-    experience_pattern = r'\b\d{4}\b.*?\b\d{4}\b'  # Matches patterns like "2019 – 2021"
-    experiences = re.findall(experience_pattern, text)
-    return experiences  # List of experience periods
 
-def allowed_file(filename):
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+def extract_email(content):
+    """Extract the first valid email address from the content."""
+    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
+    emails = re.findall(email_pattern, content)
+    return emails[0] if emails else "Email not found"
+
+
+def extract_phone(content):
+    """
+    Extracts the first valid phone number from the given content.
+    - Supports formats with international codes and separators.
+    """
+    phone_pattern = r"""
+        (?:(?:\+)?\d{1,3}[\s.-]?)?           # Optional international code (e.g., +44, +1)
+        \(?\d{2,4}\)?[\s.-]?                 # Area code, optional parentheses
+        \d{2,4}[\s.-]?\d{2,4}[\s.-]?\d{2,4}  # Main phone number
+    """
+    matches = re.findall(re.compile(phone_pattern, re.VERBOSE), content)
+    return matches[0].strip() if matches else "Phone not found"
+
+
+def detect_potential_sections(content):
+    """
+    Detects and returns key sections in the content based on predefined keywords.
+    """
+    section_keywords = {
+        'education': r'\b(education|academics)\b',
+        'experience': r'\b(experience|work experience|employment|career history)\b',
+        'skills': r'\b(skills|technical skills|technologies)\b',
+        'projects': r'\b(projects|personal projects|key projects)\b',
+        'summary': r'\b(summary|overview|profile|about me)\b',
+        'certifications': r'\b(certifications|awards|licenses)\b'
+    }
+    section_regex = '|'.join(f'(?P<{section}>{keywords})' for section, keywords in section_keywords.items())
+    matches = list(re.finditer(section_regex, content, flags=re.IGNORECASE))
+
+    if not matches:
+        return {"general": content.strip()}
+
+    sections = {}
+    for i, match in enumerate(matches):
+        section_name = match.lastgroup
+        section_start = match.end()
+        section_end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        sections[section_name] = content[section_start:section_end].strip()
+
+    return sections
+
+
+def extract_skills_spacy(doc, predefined_skills):
+    """
+    Extracts skills using a predefined list and SpaCy tokens/entities.
+    """
+    words = set(token.text.lower() for token in doc if not token.is_stop)
+    skills = [skill for skill in predefined_skills if skill in words]
+
+    for ent in doc.ents:
+        if ent.label_ in ["PRODUCT", "WORK_OF_ART"] and ent.text.lower() not in skills:
+            skills.append(ent.text.lower())
+
+    return sorted(set(skills))
+
+
+def extract_experience(content):
+    """
+    Extracts structured work experience details, including dates and roles.
+    """
+    date_pattern = r'\b(?:19|20)\d{2}\b(?:\s?[-–]\s?\b(?:19|20)\d{2})?'  # Years or ranges
+    job_title_keywords = [
+        "engineer", "developer", "scientist", "analyst", "consultant",
+        "manager", "intern", "technician"
+    ]
+
+    experiences = []
+    current_exp = None
+
+    for line in content.splitlines():
+        dates = re.findall(date_pattern, line)
+        is_job_title = any(job in line.lower() for job in job_title_keywords)
+
+        if dates or is_job_title:
+            if current_exp:
+                experiences.append(current_exp)
+            current_exp = {
+                "dates": dates,
+                "job_title": line if is_job_title else None,
+                "details": []
+            }
+        elif current_exp:
+            current_exp["details"].append(line.strip())
+
+    if current_exp:
+        experiences.append(current_exp)
+
+    for exp in experiences:
+        exp["details"] = " ".join(exp["details"]) if exp["details"] else None
+
+    return experiences
+
+
+# -------------------------------------------------------
+# File Parsing Utilities
+# -------------------------------------------------------
 
 def parse_pdf(filepath):
-    """Extract text from a PDF file using pdfplumber for better accuracy."""
-    text = ""
+    """Parses text from PDF files."""
     try:
         with pdfplumber.open(filepath) as pdf:
-            for page in pdf.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text += page_text.strip() + "\n"
-        # Post-process text to clean excessive blank lines
-        text = "\n".join([line.strip() for line in text.split("\n") if line.strip()])
+            return "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
     except Exception as e:
-        text = f"Error reading PDF file: {str(e)}"
-    return text.strip()
+        logging.error(f"Failed to parse PDF: {e}")
+        return parse_pdf_with_ocr(filepath)
+
+
+def parse_pdf_with_ocr(filepath):
+    """Fallback OCR text parsing for PDF files."""
+    pages = convert_from_path(filepath)
+    return "\n".join(image_to_string(page) for page in pages)
+
 
 def parse_docx(filepath):
-    """Extract structured text from a DOCX file (handles paragraphs, headings, tables, and more)"""
-    text = ""
+    """Parses text from DOCX files."""
     try:
         doc = docx.Document(filepath)
-
-        # Extract all paragraphs, including empty space for readability
-        for paragraph in doc.paragraphs:
-            if paragraph.text.strip():  # Ensure non-empty text
-                text += paragraph.text.strip() + "\n"
-
-        # Append table content
-        for table in doc.tables:
-            for row in table.rows:
-                row_text = [cell.text.strip() for cell in row.cells if cell.text.strip()]
-                if row_text:  # Ensure there is content in the row
-                    text += ", ".join(row_text) + "\n"
-
+        return "\n".join(paragraph.text for paragraph in doc.paragraphs)
     except Exception as e:
-        text = f"Error reading DOCX file: {str(e)}"
-    return text.strip()
+        logging.error(f"Failed to parse DOCX: {e}")
+        return ""
 
 
-@app.route("/health", methods=['GET'])
-def health_check():
-    """API Health Check"""
-    return jsonify({"status":"ResuMatch is up and running!"}), 200
+def allowed_file(filename):
+    """Validates allowed file extensions."""
+    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+# -------------------------------------------------------
+# Flask Route
+# -------------------------------------------------------
 
 @app.route("/upload", methods=['POST'])
 def upload_file():
+    """
+    Endpoint to upload and process a resume file.
+    - Handles PDF and DOCX files.
+    """
     if 'file' not in request.files:
-        return jsonify({"error": "No file part in the request"}), 400
+        return jsonify({"error": "No file provided"}), 400
 
     file = request.files['file']
 
@@ -122,33 +231,45 @@ def upload_file():
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
 
-        if filename.endswith(".pdf"):
-            content = parse_pdf(filepath)
-        elif filename.endswith(".docx"):
-            content = parse_docx(filepath)
-        else:
-            content = "Unsupported file format"
+        # Parse content based on file type
+        content = parse_pdf(filepath) if filename.endswith('.pdf') else parse_docx(filepath)
+        if not content.strip():
+            return jsonify({"error": "Could not extract text from the file"}), 400
 
-        name = extract_name(content)
-        email = extract_email(content)
-        phone = extract_phone(content)
-        skills = extract_skills(content)
-        experience = extract_experience(content)
+        processed_content = preprocess_content(content)
 
-        return jsonify({
-            "message": "File uploaded and parsed successfully",
-            "filename": filename,
-            "parsed_content": {
-                "name": name,
-                "email": email,
-                "phone": phone,
-                "skills": skills,
-                "experience": experience
-            }
-        }), 200
-    else:
-        return jsonify({"error": "Allowed file types are: .pdf, .docx"}), 400
+        # Extract resume data
+        doc = nlp(processed_content)
+        name = extract_name(processed_content)
+        email = extract_email(processed_content)
+        phone = extract_phone(processed_content)
+        sections = detect_potential_sections(processed_content)
+        predefined_skills = [
+            'python', 'java', 'c++', 'machine learning', 'deep learning',
+            'sql', 'html', 'css', 'javascript', 'react', 'node.js',
+            'aws', 'docker', 'kubernetes', 'flask', 'django', 'tensorflow', 'azure'
+        ]
+        skills = extract_skills_spacy(doc, predefined_skills)
+        experience = extract_experience(sections.get('experience', ''))
 
+        response = {
+            "name": name,
+            "email": email,
+            "phone": phone,
+            "sections": sections,
+            "skills": skills,
+            "experience": experience
+        }
+
+        logging.debug(f"Parsed Response: {response}")
+        return jsonify(response), 200
+
+    return jsonify({"error": "Unsupported file format"}), 400
+
+
+# -------------------------------------------------------
+# Run Flask Application
+# -------------------------------------------------------
 
 if __name__ == "__main__":
     app.run(debug=True)
