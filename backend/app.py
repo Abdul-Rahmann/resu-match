@@ -12,53 +12,35 @@ from pdf2image import convert_from_path
 from pytesseract import image_to_string
 from sentence_transformers import SentenceTransformer, util
 
-# Initialize Flask app and SpaCy
 app = Flask(__name__)
-nlp = spacy.load("en_core_web_lg")  # Load SpaCy language model
-skill_model = SentenceTransformer('all-MiniLM-L6-v2')  # Load sentence embedding model
+nlp = spacy.load("en_core_web_lg")
+skill_model = SentenceTransformer('all-MiniLM-L6-v2')
 
-# Constants
 UPLOAD_FOLDER = './uploads'
 ALLOWED_EXTENSIONS = {'pdf', 'docx'}
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
-# Logging configuration
 logging.basicConfig(level=logging.DEBUG)
 
-# Predefined technical skills for validation
 technical_skills_list = [
     "python", "java", "c++", "machine learning", "deep learning", "sql", "html",
     "css", "javascript", "react", "docker", "aws", "flask", "django", "tensorflow",
     "keras", "pandas", "numpy", "matplotlib", "seaborn", "scikit-learn", "pytorch"
 ]
-technical_skills_set = set(technical_skills_list)  # Faster lookup
+technical_skills_set = set(technical_skills_list)
 
 
-# -------------------------------------------------------
-# Skill Extraction Functions
-# -------------------------------------------------------
-
+# Skill extraction with semantic similarity
 def validate_skill_with_similarity(term):
-    """
-    Uses semantic similarity to validate whether the extracted term is a real skill.
-    """
     term_embedding = skill_model.encode(term, convert_to_tensor=True)
     skill_embeddings = skill_model.encode(technical_skills_list, convert_to_tensor=True)
-
-    similarities = util.pytorch_cos_sim(term_embedding, skill_embeddings)
-    max_similarity = similarities.max().item()
-
-    return max_similarity > 0.7  # Accept terms with high similarity to predefined skills
+    max_similarity = util.pytorch_cos_sim(term_embedding, skill_embeddings).max().item()
+    return max_similarity > 0.7
 
 
 def skill_extraction(doc):
-    """
-    Extract meaningful, job-relevant skills from resume text.
-    """
     extracted_skills = set()
-
-    # Named Entity Recognition (NER) & Token-based Extraction
     for ent in doc.ents:
         if ent.label_ in ["PRODUCT", "WORK_OF_ART", "ORG"]:
             term = ent.text.lower().strip()
@@ -74,52 +56,38 @@ def skill_extraction(doc):
 
     return sorted(extracted_skills)
 
+
 def compare_skills(resume_skills, job_skills):
-    """
-    Compare resume skills with job description skills using semantic similarity.
-    """
-    if not resume_skills or not job_skills:  # Check for empty lists
+    if not resume_skills or not job_skills:
         return {
             "skills_matched": [],
-            "skills_missing": job_skills,  # If resume has no skills, all job skills are missing
+            "skills_missing": job_skills,
             "match_percentage": 0.0
         }
 
     resume_skills_set = set(resume_skills)
     job_skills_set = set(job_skills)
-
     matched_skills = list(resume_skills_set & job_skills_set)
     missing_skills = list(job_skills_set - resume_skills_set)
 
-    # Ensure we are not passing an empty list to the model
     if not resume_skills_set or not job_skills_set:
-        return {
-            "skills_matched": matched_skills,
-            "skills_missing": missing_skills,
-            "match_percentage": round(len(matched_skills) / len(job_skills_set) * 100 if job_skills_set else 0, 2)
-        }
+        match_percentage = len(matched_skills) / len(job_skills_set) * 100 if job_skills_set else 0
+        return {"skills_matched": matched_skills, "skills_missing": missing_skills,
+                "match_percentage": round(match_percentage, 2)}
 
-    # Encode skills using Sentence-BERT only if both lists are non-empty
-    resume_list = list(resume_skills_set)
-    job_list = list(job_skills_set)
+    resume_embeddings = skill_model.encode(list(resume_skills_set), convert_to_tensor=True)
+    job_embeddings = skill_model.encode(list(job_skills_set), convert_to_tensor=True)
 
-    resume_embeddings = skill_model.encode(resume_list, convert_to_tensor=True)
-    job_embeddings = skill_model.encode(job_list, convert_to_tensor=True)
-
-    # Ensure embeddings are not empty before computing similarity
     if resume_embeddings.shape[0] == 0 or job_embeddings.shape[0] == 0:
-        return {
-            "skills_matched": matched_skills,
-            "skills_missing": missing_skills,
-            "match_percentage": round(len(matched_skills) / len(job_skills_set) * 100 if job_skills_set else 0, 2)
-        }
+        match_percentage = len(matched_skills) / len(job_skills_set) * 100 if job_skills_set else 0
+        return {"skills_matched": matched_skills, "skills_missing": missing_skills,
+                "match_percentage": round(match_percentage, 2)}
 
     similarity_scores = util.pytorch_cos_sim(job_embeddings, resume_embeddings)
 
-    # Match job skills with the best corresponding resume skill
-    for job_idx, job_skill in enumerate(job_list):
+    for job_idx, job_skill in enumerate(list(job_skills_set)):
         best_match_idx = similarity_scores[job_idx].argmax().item()
-        best_match = resume_list[best_match_idx]
+        best_match = list(resume_skills_set)[best_match_idx]
         max_sim = similarity_scores[job_idx, best_match_idx].item()
 
         if max_sim > 0.75 and job_skill not in matched_skills:
@@ -128,7 +96,6 @@ def compare_skills(resume_skills, job_skills):
                 missing_skills.remove(job_skill)
 
     match_percentage = (len(matched_skills) / len(job_skills_set)) * 100 if job_skills_set else 0
-
     return {
         "skills_matched": matched_skills,
         "skills_missing": missing_skills,
@@ -136,51 +103,39 @@ def compare_skills(resume_skills, job_skills):
     }
 
 
-# -------------------------------------------------------
-# Extract Name, Email, Phone Number from Resume
-# -------------------------------------------------------
-
+# Extract candidate information
 def extract_name(content):
-    """Extract the candidate's name from the resume."""
-    doc = nlp(content)
+    doc = spacy.load("en_core_web_sm")(content)
+    excluded_labels = {"ORG", "PRODUCT", "GPE", "NORP", "WORK_OF_ART", "FAC", "LANGUAGE"}
+
     for ent in doc.ents:
-        if ent.label_ == "PERSON" and 1 <= len(ent.text.split()) <= 3:
+        if ent.label_ == "PERSON" and ent.label_ not in excluded_labels:
             return ent.text.strip()
 
-    # Fallback: Assume the name is in the first few lines
-    lines = content.splitlines()
-    for line in lines[:5]:
-        line = line.strip()
-        if re.match(r"^[A-Z][a-z]+(?:\s[A-Z][a-z]+)*$", line):
-            return line
+    for line in content.splitlines()[:5]:
+        if re.match(r"^[a-z]+(?:\s[a-z]+)*$", line.strip(), re.IGNORECASE):
+            return line.strip()
 
     return "Name not found"
 
 
 def extract_email(content):
-    """Extract the first valid email address from the content."""
-    email_pattern = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    emails = re.findall(email_pattern, content)
+    emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', content)
     return emails[0] if emails else "Email not found"
 
 
 def extract_phone(content):
-    """Extract the first valid phone number from the content."""
     phone_pattern = r"""
-        (?:(?:\+)?\d{1,3}[\s.-]?)?           # Optional international code (e.g., +44, +1)
-        \(?\d{2,4}\)?[\s.-]?                 # Area code, optional parentheses
-        \d{2,4}[\s.-]?\d{2,4}[\s.-]?\d{2,4}  # Main phone number
+        (?:(?:\+)?\d{1,3}[\s.-]?)?
+        \(?\d{2,4}\)?[\s.-]?
+        \d{2,4}[\s.-]?\d{2,4}[\s.-]?\d{2,4}
     """
     matches = re.findall(re.compile(phone_pattern, re.VERBOSE), content)
     return matches[0].strip() if matches else "Phone not found"
 
 
-# -------------------------------------------------------
-# Detect Resume Sections (Education, Experience, Skills, etc.)
-# -------------------------------------------------------
-
+# Detect sections in resumes
 def detect_potential_sections(content):
-    """Detects key sections in the content based on predefined keywords."""
     section_keywords = {
         'education': r'\b(education|academics)\b',
         'experience': r'\b(experience|work experience|employment|career history)\b',
@@ -204,33 +159,23 @@ def detect_potential_sections(content):
 
     return sections
 
-# -------------------------------------------------------
-# File Parsing & Preprocessing Functions
-# -------------------------------------------------------
 
+# File parsing and preprocessing
 def preprocess_content(content):
-    """
-    Cleans resume/job description text for better NLP processing.
-    """
-    content = re.sub(r'[^\x00-\x7F]+', ' ', content)  # Remove non-ASCII characters
-    content = re.sub(r'\s*\|\s*', ' ', content)  # Remove vertical bars
-    content = re.sub(r'\s+', ' ', content).strip()  # Normalize spaces
-    content = re.sub(r'\b\d+\b', '', content)  # Remove standalone numbers
+    content = re.sub(r'[^\x00-\x7F]+', ' ', content)
+    content = re.sub(r'\s*\|\s*', ' ', content)
+    content = re.sub(r'\s+', ' ', content).strip()
+    content = re.sub(r'\b\d+\b', '', content)
     return content.lower()
 
 
 def preprocess_image(image):
-    """
-    Preprocesses an image to enhance OCR accuracy.
-    """
     gray = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    threshold = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-    return threshold
+    return cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
 
 
 def parse_pdf(filepath):
-    """Parses text from PDF files."""
     try:
         with pdfplumber.open(filepath) as pdf:
             return "\n".join(page.extract_text() for page in pdf.pages if page.extract_text())
@@ -240,13 +185,11 @@ def parse_pdf(filepath):
 
 
 def parse_pdf_with_ocr(filepath):
-    """Uses OCR to extract text from PDFs."""
     pages = convert_from_path(filepath)
     return "\n".join(image_to_string(preprocess_image(page)) for page in pages)
 
 
 def parse_docx(filepath):
-    """Parses text from DOCX files."""
     try:
         doc = docx.Document(filepath)
         return "\n".join(paragraph.text for paragraph in doc.paragraphs)
@@ -256,33 +199,24 @@ def parse_docx(filepath):
 
 
 def allowed_file(filename):
-    """Validates allowed file extensions."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 
-# -------------------------------------------------------
-# Flask Routes
-# -------------------------------------------------------
-
+# Flask routes
 @app.route("/upload", methods=['POST'])
 def upload_file():
-    """
-    Endpoint to upload and process a resume file.
-    """
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files['file']
-    job_description_skills = request.form.get("job_description_skills", "")
-    job_description_skills = [skill.strip().lower() for skill in job_description_skills.split(",") if skill]
+    job_description_skills = [skill.strip().lower() for skill in
+                              request.form.get("job_description_skills", "").split(",") if skill]
 
     if file and allowed_file(file.filename):
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], secure_filename(file.filename))
         file.save(filepath)
 
-        # Parse content
-        content = parse_pdf(filepath) if filename.endswith('.pdf') else parse_docx(filepath)
+        content = parse_pdf(filepath) if filepath.endswith('.pdf') else parse_docx(filepath)
         if not content.strip():
             return jsonify({"error": "Could not extract text from file"}), 400
 
@@ -291,7 +225,6 @@ def upload_file():
 
         skills = skill_extraction(doc)
         skills_comparison = compare_skills(skills, job_description_skills)
-
         response = {
             "name": extract_name(processed_content),
             "email": extract_email(processed_content),
@@ -306,10 +239,6 @@ def upload_file():
 
     return jsonify({"error": "Unsupported file format"}), 400
 
-
-# -------------------------------------------------------
-# Run Flask Application
-# -------------------------------------------------------
 
 if __name__ == "__main__":
     app.run(debug=True)
